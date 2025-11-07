@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Бинарники (не показывать дифы)
+*.jpg binary
+*.png binary
+*.jpeg binary
+*.npy binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.bin binary
+*.safetensors binary
+*.onnx binary
