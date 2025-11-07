@@ -1,0 +1,42 @@
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.log
+
+# Локальные конфиги/секреты
+.env
+.env.*
+*.local.yaml
+*.local.json
+
+# Данные и индексы — НЕ пушим
+data/
+index/
+meta/
+outputs/
+runs/
+checkpoints/
+cache/
+tmp/
+logs/
+
+# Тяжёлые бинарники/модели
+*.npy
+*.npz
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.tflite
+*.zip
+*.tar
+*.tar.gz
