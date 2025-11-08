@@ -1,436 +1,601 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-validate_index.py — Валидация и самопроверка индекса
+validate_index.py — валидация индекса с метриками и диагностикой
 
-Функции:
-  ✅ Self-testing: использует кропы как query и проверяет точность
-  ✅ Quality metrics: средняя similarity, геометрия, распределение
-  ✅ Auto-tuning: подбирает оптимальные параметры (geom_weight, verify_k)
-  ✅ Benchmark: замеряет скорость поиска
+Проверяет:
+  1. Top-K accuracy (модель находит свои фото?)
+  2. Mean Reciprocal Rank (MRR)
+  3. Mean Average Precision (MAP)
+  4. Распределение расстояний до правильного match
+  5. Preprocessing consistency (query vs index)
+  6. Визуализация ближайших соседей
 
 Использование:
   # Базовая валидация
-  python scripts/validate_index.py
-
-  # С auto-tuning параметров
-  python scripts/validate_index.py --auto-tune
-
-  # Только быстрые тесты
-  python scripts/validate_index.py --quick
+  python scripts/validate_index.py --test-size 100
+  
+  # Полная диагностика с визуализацией
+  python scripts/validate_index.py --test-size 500 --visualize --save-failures
+  
+  # Только проверка preprocessing
+  python scripts/validate_index.py --check-preprocessing
 """
 
+from __future__ import annotations
 import os
 import sys
 import json
 import argparse
 import random
 from pathlib import Path
-from typing import List, Dict, Tuple
-import time
+from collections import defaultdict
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 import torch
 import hnswlib
 
-# Подавляем варнинги
-import warnings
-warnings.filterwarnings("ignore")
-
 # ========================= Константы =========================
 SEED = 42
-DEFAULT_TEST_SIZE = 100  # Кропов для тестирования
-DEFAULT_QUICK_SIZE = 20
+DEFAULT_TILE_SIZE = 336
+DEFAULT_TILE_STRIDE = 224
+DEFAULT_EF = 256
 
-# ========================= Utils =========================
+# ========================= Утилиты =========================
 
-def load_index(index_dir: Path) -> Tuple:
-    """Загрузить индекс и метаданные"""
-    print(f"\n📂 Загрузка индекса из: {index_dir}")
+def pick_device():
+    """Автоопределение устройства"""
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def load_model_from_index(index_dir: Path):
+    """Загрузка CLIP модели из индекса"""
+    import open_clip
     
-    # Метаданные
+    index_dir = Path(index_dir)
+    model_name = "ViT-L-14"
+    pretrained = "openai"
+    
+    meta_json = index_dir / "model.json"
+    if meta_json.exists():
+        try:
+            meta = json.loads(meta_json.read_text())
+            model_name = meta.get("model", model_name)
+            pretrained = meta.get("pretrained", pretrained)
+        except Exception as e:
+            print(f"[!] Ошибка чтения model.json: {e}")
+    
+    try:
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained
+        )
+    except Exception as e:
+        print(f"[!] Ошибка загрузки модели: {e}")
+        sys.exit(1)
+    
+    model.eval()
+    return model, preprocess, model_name
+
+
+def tile_image_pil(pil_img: Image.Image, size=336, stride=224):
+    """Тайлинг изображения с перекрытием"""
+    W, H = pil_img.size
+    tiles = []
+    
+    for y in range(0, max(1, H - size + 1), stride):
+        for x in range(0, max(1, W - size + 1), stride):
+            tile = pil_img.crop((x, y, x + size, y + size))
+            tiles.append(tile)
+    
+    if not tiles:
+        tiles = [pil_img.resize((size, size), Image.BICUBIC)]
+    
+    return tiles
+
+
+def compute_query_embedding(
+    img_path: str,
+    model,
+    preprocess,
+    device,
+    tile_size=336,
+    tile_stride=224,
+    aggregation="max"
+):
+    """Вычисление эмбеддинга запроса (как в 05_query.py)"""
+    img = Image.open(img_path).convert("RGB")
+    tiles = tile_image_pil(img, size=tile_size, stride=tile_stride)
+    
+    embeds = []
+    with torch.inference_mode():
+        for t in tiles:
+            ten = preprocess(t).unsqueeze(0).to(device)
+            e = model.encode_image(ten)
+            e = torch.nn.functional.normalize(e, dim=-1)
+            embeds.append(e)
+    
+    E = torch.stack(embeds, dim=0).squeeze(1)  # [T, D]
+    
+    if aggregation == "max":
+        q_emb = torch.amax(E, dim=0)
+    elif aggregation == "mean":
+        q_emb = torch.mean(E, dim=0)
+    elif aggregation == "first":
+        q_emb = E[0]
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+    
+    q_emb = q_emb.detach().cpu().numpy()
+    q_emb = q_emb / (np.linalg.norm(q_emb) + 1e-9)
+    
+    return q_emb
+
+
+# ========================= Метрики =========================
+
+def compute_metrics(results: List[Dict], verbose=True):
+    """
+    Вычисление метрик валидации
+    
+    Args:
+        results: Список результатов с полями:
+            - query_idx: индекс запроса
+            - ground_truth: список правильных индексов
+            - retrieved: список найденных индексов (отсортированы по релевантности)
+    
+    Returns:
+        Dict с метриками
+    """
+    topk_acc = {1: 0, 5: 0, 10: 0, 50: 0, 100: 0}
+    reciprocal_ranks = []
+    avg_precisions = []
+    distances = []  # Расстояния до правильного match
+    
+    for res in results:
+        gt_set = set(res["ground_truth"])
+        retrieved = res["retrieved"]
+        
+        # Top-K accuracy
+        for k in topk_acc.keys():
+            if any(idx in gt_set for idx in retrieved[:k]):
+                topk_acc[k] += 1
+        
+        # Reciprocal Rank
+        rank = None
+        for i, idx in enumerate(retrieved):
+            if idx in gt_set:
+                rank = i + 1
+                break
+        
+        if rank is not None:
+            reciprocal_ranks.append(1.0 / rank)
+            distances.append(rank)
+        else:
+            reciprocal_ranks.append(0.0)
+            distances.append(len(retrieved) + 1)
+        
+        # Average Precision
+        hits = 0
+        precisions = []
+        for i, idx in enumerate(retrieved):
+            if idx in gt_set:
+                hits += 1
+                precisions.append(hits / (i + 1))
+        
+        if precisions:
+            avg_precisions.append(np.mean(precisions))
+        else:
+            avg_precisions.append(0.0)
+    
+    # Нормализация
+    n = len(results)
+    for k in topk_acc.keys():
+        topk_acc[k] = (topk_acc[k] / n) * 100.0
+    
+    mrr = np.mean(reciprocal_ranks) if reciprocal_ranks else 0.0
+    map_score = np.mean(avg_precisions) if avg_precisions else 0.0
+    
+    metrics = {
+        "top1_acc": topk_acc[1],
+        "top5_acc": topk_acc[5],
+        "top10_acc": topk_acc[10],
+        "top50_acc": topk_acc[50],
+        "top100_acc": topk_acc[100],
+        "mrr": mrr,
+        "map": map_score,
+        "mean_distance": np.mean(distances),
+        "median_distance": np.median(distances),
+    }
+    
+    if verbose:
+        print("\n" + "=" * 60)
+        print("📊 МЕТРИКИ ВАЛИДАЦИИ")
+        print("=" * 60)
+        print(f"Top-1 Accuracy:   {metrics['top1_acc']:>6.2f}%")
+        print(f"Top-5 Accuracy:   {metrics['top5_acc']:>6.2f}%")
+        print(f"Top-10 Accuracy:  {metrics['top10_acc']:>6.2f}%")
+        print(f"Top-50 Accuracy:  {metrics['top50_acc']:>6.2f}%")
+        print(f"Top-100 Accuracy: {metrics['top100_acc']:>6.2f}%")
+        print(f"Mean Reciprocal Rank (MRR): {metrics['mrr']:.4f}")
+        print(f"Mean Average Precision (MAP): {metrics['map']:.4f}")
+        print(f"Mean Distance to GT: {metrics['mean_distance']:.1f}")
+        print(f"Median Distance to GT: {metrics['median_distance']:.1f}")
+        print("=" * 60)
+        
+        # Интерпретация
+        if metrics['top1_acc'] >= 90:
+            print("✅ ОТЛИЧНО! Модель находит свои фото.")
+        elif metrics['top1_acc'] >= 70:
+            print("⚠️  ПРИЕМЛЕМО, но есть потенциал для улучшения.")
+        elif metrics['top1_acc'] >= 50:
+            print("⚠️  ПРОБЛЕМА! Top-1 accuracy слишком низкая.")
+        else:
+            print("🔥 КРИТИЧЕСКАЯ ПРОБЛЕМА! Модель не находит свои фото!")
+            print("   Возможные причины:")
+            print("   1. Preprocessing mismatch (query ≠ index)")
+            print("   2. Неправильная нормализация")
+            print("   3. Tile aggregation слишком агрессивная")
+            print("   4. Проблемы с моделью/весами")
+    
+    return metrics
+
+
+# ========================= Валидация =========================
+
+def validate_index(
+    index_dir: Path,
+    crops_meta: Path,
+    test_size: int = 100,
+    ef: int = 256,
+    topk: int = 100,
+    tile_size: int = 336,
+    tile_stride: int = 224,
+    aggregation: str = "max",
+    save_failures: bool = False,
+    visualize: bool = False,
+):
+    """Валидация индекса"""
+    
+    print(f"[i] Загрузка метаданных...")
     meta_parquet = index_dir / "crops.parquet"
     if meta_parquet.exists():
         meta = pd.read_parquet(meta_parquet)
     else:
-        meta = pd.read_csv("meta/crops.csv")
+        meta = pd.read_csv(crops_meta)
     
-    print(f"   Кропов в мета: {len(meta)}")
+    print(f"[✓] Загружено {len(meta)} кропов")
     
-    # Эмбеддинги
-    embs_file = None
-    for candidate in ["embs.npy", "embeddings.npy", "clip_embeddings.npy"]:
-        f = index_dir / candidate
-        if f.exists():
-            embs_file = f
-            break
-    
-    if embs_file is None:
-        raise FileNotFoundError("Не найден файл эмбеддингов!")
-    
-    embs = np.load(embs_file)
-    print(f"   Эмбеддинги: {embs.shape}")
-    
-    # HNSW
-    hnsw_file = None
-    for candidate in ["hnsw.bin", "hnsw_clip.bin"]:
-        f = index_dir / candidate
-        if f.exists():
-            hnsw_file = f
-            break
-    
-    if hnsw_file is None:
-        raise FileNotFoundError("Не найден HNSW индекс!")
-    
-    dim = embs.shape[1]
-    index = hnswlib.Index(space="cosine", dim=dim)
-    index.load_index(str(hnsw_file))
-    print(f"   HNSW: {hnsw_file.name}")
-    
-    # Model config
-    model_json = index_dir / "model.json"
-    if model_json.exists():
-        with open(model_json) as f:
-            model_config = json.load(f)
-        print(f"   Модель: {model_config.get('model', 'unknown')}")
-    else:
-        model_config = {}
-    
-    return meta, embs, index, model_config
-
-
-def sample_test_set(meta: pd.DataFrame, size: int) -> pd.DataFrame:
-    """Выбрать случайные кропы для тестирования"""
+    # Выборка тестовых изображений
     random.seed(SEED)
-    indices = random.sample(range(len(meta)), min(size, len(meta)))
-    return meta.iloc[indices].reset_index(drop=True)
-
-
-def cosine_to_sim(dist: np.ndarray) -> np.ndarray:
-    return 1.0 - dist
-
-
-# ========================= Tests =========================
-
-class IndexValidator:
-    """Валидатор индекса"""
+    valid_indices = [i for i in range(len(meta)) if os.path.exists(meta.iloc[i]["path"])]
     
-    def __init__(self, meta, embs, index, model_config):
-        self.meta = meta
-        self.embs = embs
-        self.index = index
-        self.model_config = model_config
-        
-        self.results = {
-            "total_tests": 0,
-            "passed": 0,
-            "failed": 0,
-            "metrics": {},
-        }
+    if len(valid_indices) < test_size:
+        print(f"[!] Недостаточно валидных изображений ({len(valid_indices)}), уменьшаю test_size")
+        test_size = len(valid_indices)
     
-    def test_self_retrieval(self, test_set: pd.DataFrame, topk: int = 50) -> Dict:
-        """
-        Тест самопоиска: каждый кроп должен найти сам себя в топ-1
-        """
-        print("\n" + "="*80)
-        print("🔍 ТЕСТ 1: Self-Retrieval (кроп находит сам себя)")
-        print("="*80)
+    test_indices = random.sample(valid_indices, test_size)
+    print(f"[i] Тестовая выборка: {test_size} изображений")
+    
+    # Загрузка модели
+    print(f"\n[i] Загрузка CLIP модели...")
+    device = pick_device()
+    model, preprocess, model_name = load_model_from_index(index_dir)
+    model.to(device)
+    print(f"[✓] Модель загружена: {model_name} на {device}")
+    
+    # Загрузка индекса
+    print(f"\n[i] Загрузка HNSW индекса...")
+    index_path = index_dir / "hnsw.bin"
+    if not index_path.exists():
+        print(f"[!] Не найден индекс: {index_path}")
+        sys.exit(1)
+    
+    embs_path = index_dir / "embs.npy"
+    embs = np.load(embs_path)
+    dim = embs.shape[1]
+    
+    index = hnswlib.Index(space="cosine", dim=dim)
+    index.load_index(str(index_path))
+    index.set_ef(ef)
+    print(f"[✓] HNSW готов (ef={ef})")
+    
+    # Валидация
+    print(f"\n[i] Запуск валидации...")
+    results = []
+    
+    for test_idx in tqdm(test_indices, desc="Валидация", unit="img"):
+        row = meta.iloc[test_idx]
+        img_path = row["path"]
+        pano_id = row["pano_id"]
         
-        self.index.set_ef(200)
-        
-        correct_top1 = 0
-        correct_top5 = 0
-        correct_top10 = 0
-        similarities = []
-        ranks = []
-        
-        for idx, row in tqdm(test_set.iterrows(), total=len(test_set), desc="Self-retrieval"):
-            # Получаем эмбеддинг кропа
-            crop_idx = meta[meta["crop_id"] == row["crop_id"]].index[0]
-            q_emb = self.embs[crop_idx:crop_idx+1]
+        try:
+            # Вычисление эмбеддинга запроса
+            q_emb = compute_query_embedding(
+                img_path, model, preprocess, device,
+                tile_size=tile_size, tile_stride=tile_stride,
+                aggregation=aggregation
+            )
             
             # Поиск
-            labels, dists = self.index.knn_query(q_emb, k=topk)
-            labels = labels[0]
-            sims = cosine_to_sim(dists[0])
+            labels, dists = index.knn_query(q_emb, k=topk)
+            retrieved = labels[0].tolist()
             
-            # Проверяем где находится сам кроп
-            if crop_idx in labels:
-                rank = np.where(labels == crop_idx)[0][0] + 1
-                ranks.append(rank)
-                
-                if rank == 1:
-                    correct_top1 += 1
-                if rank <= 5:
-                    correct_top5 += 1
-                if rank <= 10:
-                    correct_top10 += 1
-                
-                similarities.append(sims[rank-1])
-            else:
-                ranks.append(topk + 1)
-                similarities.append(0.0)
-        
-        # Результаты
-        total = len(test_set)
-        top1_acc = correct_top1 / total * 100
-        top5_acc = correct_top5 / total * 100
-        top10_acc = correct_top10 / total * 100
-        avg_sim = np.mean(similarities) if similarities else 0
-        avg_rank = np.mean(ranks)
-        
-        print(f"\n📊 Результаты:")
-        print(f"   Top-1 точность: {top1_acc:.1f}% ({correct_top1}/{total})")
-        print(f"   Top-5 точность: {top5_acc:.1f}% ({correct_top5}/{total})")
-        print(f"   Top-10 точность: {top10_acc:.1f}% ({correct_top10}/{total})")
-        print(f"   Средняя similarity: {avg_sim:.4f}")
-        print(f"   Средний ранг: {avg_rank:.1f}")
-        
-        # Оценка
-        if top1_acc >= 95:
-            print("   ✅ ОТЛИЧНО! Индекс работает идеально")
-        elif top1_acc >= 85:
-            print("   ✅ ХОРОШО! Индекс работает корректно")
-        elif top1_acc >= 70:
-            print("   ⚠️  УДОВЛЕТВОРИТЕЛЬНО. Возможны проблемы с нормализацией")
-        else:
-            print("   ❌ ПЛОХО! Индекс работает неправильно!")
-        
-        self.results["test_self_retrieval"] = {
-            "top1_acc": top1_acc,
-            "top5_acc": top5_acc,
-            "top10_acc": top10_acc,
-            "avg_similarity": float(avg_sim),
-            "avg_rank": float(avg_rank),
-        }
-        
-        return self.results["test_self_retrieval"]
+            # Ground truth — все кропы этой панорамы
+            gt_indices = meta[meta["pano_id"] == pano_id].index.tolist()
+            
+            results.append({
+                "query_idx": test_idx,
+                "pano_id": pano_id,
+                "ground_truth": gt_indices,
+                "retrieved": retrieved,
+                "distances": dists[0].tolist(),
+            })
+            
+        except Exception as e:
+            print(f"[!] Ошибка для {img_path}: {e}")
+            continue
     
-    def test_same_pano_retrieval(self, test_set: pd.DataFrame, topk: int = 50) -> Dict:
-        """
-        Тест поиска той же панорамы: кропы одной панорамы должны находиться близко
-        """
-        print("\n" + "="*80)
-        print("🔍 ТЕСТ 2: Same-Pano Retrieval (находит кропы той же панорамы)")
-        print("="*80)
-        
-        self.index.set_ef(200)
-        
-        same_pano_in_top5 = 0
-        same_pano_in_top10 = 0
-        avg_same_pano_count = []
-        
-        for idx, row in tqdm(test_set.iterrows(), total=len(test_set), desc="Same-pano"):
-            crop_idx = meta[meta["crop_id"] == row["crop_id"]].index[0]
-            pano_id = row["pano_id"]
-            
-            q_emb = self.embs[crop_idx:crop_idx+1]
-            labels, dists = self.index.knn_query(q_emb, k=topk)
-            labels = labels[0]
-            
-            # Сколько кропов той же панорамы в топ-K
-            same_pano_labels = meta.iloc[labels]["pano_id"] == pano_id
-            same_count_top50 = same_pano_labels.sum()
-            same_count_top5 = same_pano_labels[:5].sum()
-            same_count_top10 = same_pano_labels[:10].sum()
-            
-            avg_same_pano_count.append(same_count_top50)
-            
-            if same_count_top5 >= 2:  # Минимум 2 кропа (сам + ещё один)
-                same_pano_in_top5 += 1
-            if same_count_top10 >= 3:
-                same_pano_in_top10 += 1
-        
-        total = len(test_set)
-        top5_rate = same_pano_in_top5 / total * 100
-        top10_rate = same_pano_in_top10 / total * 100
-        avg_count = np.mean(avg_same_pano_count)
-        
-        print(f"\n📊 Результаты:")
-        print(f"   Кропы той же панорамы в Top-5: {top5_rate:.1f}%")
-        print(f"   Кропы той же панорамы в Top-10: {top10_rate:.1f}%")
-        print(f"   Среднее кол-во кропов в Top-50: {avg_count:.1f}")
-        
-        if top5_rate >= 80:
-            print("   ✅ ОТЛИЧНО! Кропы панорам группируются правильно")
-        elif top5_rate >= 60:
-            print("   ✅ ХОРОШО!")
-        else:
-            print("   ⚠️  СЛАБО. Возможно нужно больше кропов на панораму")
-        
-        self.results["test_same_pano"] = {
-            "top5_rate": top5_rate,
-            "top10_rate": top10_rate,
-            "avg_same_pano_count": float(avg_count),
-        }
-        
-        return self.results["test_same_pano"]
+    # Вычисление метрик
+    metrics = compute_metrics(results, verbose=True)
     
-    def test_similarity_distribution(self) -> Dict:
-        """
-        Тест распределения similarity: проверяем что эмбеддинги нормализованы
-        """
-        print("\n" + "="*80)
-        print("📊 ТЕСТ 3: Распределение Similarity")
-        print("="*80)
-        
-        # Берём случайные 500 эмбеддингов
-        sample_size = min(500, len(self.embs))
-        indices = random.sample(range(len(self.embs)), sample_size)
-        sample_embs = self.embs[indices]
-        
-        # Считаем нормы
-        norms = np.linalg.norm(sample_embs, axis=1)
-        avg_norm = float(np.mean(norms))
-        std_norm = float(np.std(norms))
-        
-        print(f"\n📊 Нормы эмбеддингов:")
-        print(f"   Среднее: {avg_norm:.6f}")
-        print(f"   Std: {std_norm:.6f}")
-        print(f"   Min: {norms.min():.6f}")
-        print(f"   Max: {norms.max():.6f}")
-        
-        # Проверка нормализации
-        is_normalized = (0.99 <= avg_norm <= 1.01) and (std_norm < 0.01)
-        
-        if is_normalized:
-            print("   ✅ ОТЛИЧНО! Эмбеддинги правильно нормализованы")
-        else:
-            print("   ⚠️  ПРОБЛЕМА! Эмбеддинги не нормализованы (может быть медленнее)")
-        
-        self.results["test_similarity_dist"] = {
-            "avg_norm": avg_norm,
-            "std_norm": std_norm,
-            "is_normalized": is_normalized,
-        }
-        
-        return self.results["test_similarity_dist"]
+    # Сохранение результатов
+    results_path = index_dir / "validation_results.json"
+    with open(results_path, "w") as f:
+        json.dump({
+            "metrics": metrics,
+            "test_size": test_size,
+            "config": {
+                "ef": ef,
+                "topk": topk,
+                "tile_size": tile_size,
+                "tile_stride": tile_stride,
+                "aggregation": aggregation,
+            },
+        }, f, indent=2)
     
-    def benchmark_speed(self, test_set: pd.DataFrame, topk: int = 50) -> Dict:
-        """
-        Benchmark скорости поиска
-        """
-        print("\n" + "="*80)
-        print("⚡ BENCHMARK: Скорость поиска")
-        print("="*80)
-        
-        self.index.set_ef(200)
-        
-        times = []
-        
-        for idx, row in tqdm(test_set.iterrows(), total=len(test_set), desc="Benchmark"):
-            crop_idx = meta[meta["crop_id"] == row["crop_id"]].index[0]
-            q_emb = self.embs[crop_idx:crop_idx+1]
-            
-            start = time.time()
-            labels, dists = self.index.knn_query(q_emb, k=topk)
-            elapsed = time.time() - start
-            
-            times.append(elapsed * 1000)  # в миллисекунды
-        
-        avg_time = np.mean(times)
-        p50_time = np.percentile(times, 50)
-        p95_time = np.percentile(times, 95)
-        p99_time = np.percentile(times, 99)
-        
-        queries_per_sec = 1000 / avg_time if avg_time > 0 else 0
-        
-        print(f"\n⏱️  Время поиска (k={topk}):")
-        print(f"   Среднее: {avg_time:.2f} ms")
-        print(f"   P50: {p50_time:.2f} ms")
-        print(f"   P95: {p95_time:.2f} ms")
-        print(f"   P99: {p99_time:.2f} ms")
-        print(f"   Queries/sec: {queries_per_sec:.1f}")
-        
-        if avg_time < 50:
-            print("   ⚡ ОТЛИЧНО! Очень быстро")
-        elif avg_time < 100:
-            print("   ✅ ХОРОШО!")
-        else:
-            print("   ⚠️  МЕДЛЕННО. Возможно нужно уменьшить ef или M")
-        
-        self.results["benchmark"] = {
-            "avg_time_ms": float(avg_time),
-            "p95_time_ms": float(p95_time),
-            "queries_per_sec": float(queries_per_sec),
-        }
-        
-        return self.results["benchmark"]
+    print(f"\n[✓] Результаты сохранены: {results_path}")
     
-    def save_report(self, output_path: str):
-        """Сохранить отчёт в JSON"""
-        with open(output_path, "w") as f:
-            json.dump(self.results, f, indent=2)
-        print(f"\n💾 Отчёт сохранён: {output_path}")
+    # Визуализация
+    if visualize:
+        visualize_results(results, meta, index_dir)
+    
+    # Сохранение failures
+    if save_failures:
+        save_failure_cases(results, meta, index_dir)
+    
+    return metrics, results
+
+
+def visualize_results(results: List[Dict], meta: pd.DataFrame, index_dir: Path):
+    """Визуализация результатов валидации"""
+    print(f"\n[i] Создание визуализаций...")
+    
+    vis_dir = index_dir / "validation_viz"
+    vis_dir.mkdir(exist_ok=True)
+    
+    # 1. Распределение рангов правильного match
+    ranks = []
+    for res in results:
+        gt_set = set(res["ground_truth"])
+        for i, idx in enumerate(res["retrieved"]):
+            if idx in gt_set:
+                ranks.append(i + 1)
+                break
+        else:
+            ranks.append(len(res["retrieved"]) + 1)
+    
+    plt.figure(figsize=(10, 6))
+    plt.hist(ranks, bins=50, edgecolor='black')
+    plt.xlabel("Rank of Ground Truth")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Ground Truth Ranks")
+    plt.yscale("log")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(vis_dir / "ranks_distribution.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    
+    # 2. Распределение cosine distances
+    distances = []
+    for res in results:
+        distances.extend(res["distances"][:10])  # Top-10
+    
+    plt.figure(figsize=(10, 6))
+    plt.hist(distances, bins=50, edgecolor='black')
+    plt.xlabel("Cosine Distance")
+    plt.ylabel("Frequency")
+    plt.title("Distribution of Cosine Distances (Top-10)")
+    plt.grid(True, alpha=0.3)
+    plt.savefig(vis_dir / "distances_distribution.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    
+    print(f"[✓] Визуализации сохранены: {vis_dir}")
+
+
+def save_failure_cases(results: List[Dict], meta: pd.DataFrame, index_dir: Path):
+    """Сохранение случаев где модель ошиблась"""
+    print(f"\n[i] Сохранение failure cases...")
+    
+    failures_dir = index_dir / "validation_failures"
+    failures_dir.mkdir(exist_ok=True)
+    
+    failures = []
+    for res in results:
+        gt_set = set(res["ground_truth"])
+        top1_idx = res["retrieved"][0]
+        
+        if top1_idx not in gt_set:
+            failures.append({
+                "query_idx": res["query_idx"],
+                "query_pano": res["pano_id"],
+                "retrieved_idx": top1_idx,
+                "retrieved_pano": meta.iloc[top1_idx]["pano_id"],
+                "distance": res["distances"][0],
+            })
+    
+    if failures:
+        failures_path = failures_dir / "failures.json"
+        with open(failures_path, "w") as f:
+            json.dump(failures, f, indent=2)
+        
+        print(f"[✓] Сохранено {len(failures)} failures: {failures_path}")
+    else:
+        print("[✓] Нет failures!")
+
+
+# ========================= Проверка preprocessing =========================
+
+def check_preprocessing_consistency(index_dir: Path, crops_meta: Path):
+    """
+    Проверяет consistency между preprocessing при индексации и query
+    """
+    print("\n" + "=" * 60)
+    print("🔍 ПРОВЕРКА PREPROCESSING CONSISTENCY")
+    print("=" * 60)
+    
+    # Загрузка
+    meta_parquet = index_dir / "crops.parquet"
+    if meta_parquet.exists():
+        meta = pd.read_parquet(meta_parquet)
+    else:
+        meta = pd.read_csv(crops_meta)
+    
+    device = pick_device()
+    model, preprocess, model_name = load_model_from_index(index_dir)
+    model.to(device)
+    
+    embs_path = index_dir / "embs.npy"
+    index_embs = np.load(embs_path)
+    
+    # Выбираем несколько случайных изображений
+    random.seed(SEED)
+    test_indices = random.sample(range(len(meta)), min(10, len(meta)))
+    
+    diffs = []
+    for idx in test_indices:
+        row = meta.iloc[idx]
+        img_path = row["path"]
+        
+        if not os.path.exists(img_path):
+            continue
+        
+        try:
+            # Вычисляем эмбеддинг "как при query"
+            img = Image.open(img_path).convert("RGB")
+            with torch.inference_mode():
+                ten = preprocess(img).unsqueeze(0).to(device)
+                e = model.encode_image(ten)
+                e = torch.nn.functional.normalize(e, dim=-1)
+                query_emb = e.detach().cpu().numpy()[0]
+            
+            # Нормализация
+            query_emb = query_emb / (np.linalg.norm(query_emb) + 1e-9)
+            
+            # Сравниваем с индексированным
+            index_emb = index_embs[idx]
+            
+            # Cosine similarity
+            cos_sim = np.dot(query_emb, index_emb)
+            diff = 1.0 - cos_sim
+            
+            diffs.append(diff)
+            
+            print(f"[{idx:>5}] Cosine diff: {diff:.6f} (similarity: {cos_sim:.6f})")
+            
+        except Exception as e:
+            print(f"[!] Ошибка для {img_path}: {e}")
+            continue
+    
+    if diffs:
+        mean_diff = np.mean(diffs)
+        max_diff = np.max(diffs)
+        
+        print("\n" + "-" * 60)
+        print(f"Mean preprocessing diff: {mean_diff:.6f}")
+        print(f"Max preprocessing diff:  {max_diff:.6f}")
+        print("-" * 60)
+        
+        if mean_diff < 0.001:
+            print("✅ ИДЕАЛЬНО! Preprocessing полностью совпадает.")
+        elif mean_diff < 0.01:
+            print("✅ ХОРОШО! Preprocessing почти идентичен.")
+        elif mean_diff < 0.05:
+            print("⚠️  ВНИМАНИЕ! Есть небольшие различия в preprocessing.")
+        else:
+            print("🔥 ПРОБЛЕМА! Preprocessing сильно отличается!")
+            print("   Возможные причины:")
+            print("   1. Разные параметры resize/crop")
+            print("   2. Разная нормализация")
+            print("   3. Разные версии библиотек (PIL, torchvision)")
+    
+    print("=" * 60)
 
 
 # ========================= Main =========================
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Валидация индекса с самопроверкой",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    parser = argparse.ArgumentParser(
+        description="Валидация индекса с метриками и диагностикой"
     )
     
-    ap.add_argument("--index-dir", default="index")
-    ap.add_argument("--test-size", type=int, default=DEFAULT_TEST_SIZE,
-                    help="Кол-во кропов для тестирования")
-    ap.add_argument("--quick", action="store_true",
-                    help="Быстрый тест (меньше кропов)")
-    ap.add_argument("--report", default="validation_report.json",
-                    help="Куда сохранить отчёт")
-    ap.add_argument("--auto-tune", action="store_true",
-                    help="Auto-tuning параметров (пока не реализовано)")
+    # Основные параметры
+    parser.add_argument("--index-dir", default="index", help="Папка с индексом")
+    parser.add_argument("--crops-meta", default="meta/crops.csv", help="Метаданные кропов")
+    parser.add_argument("--test-size", type=int, default=100, help="Размер тестовой выборки")
     
-    args = ap.parse_args()
+    # HNSW параметры
+    parser.add_argument("--ef", type=int, default=DEFAULT_EF, help="HNSW ef parameter")
+    parser.add_argument("--topk", type=int, default=100, help="Сколько соседей искать")
     
-    print("=" * 80)
-    print("🔬 ВАЛИДАЦИЯ ИНДЕКСА")
-    print("=" * 80)
+    # Query параметры
+    parser.add_argument("--tile-size", type=int, default=DEFAULT_TILE_SIZE)
+    parser.add_argument("--tile-stride", type=int, default=DEFAULT_TILE_STRIDE)
+    parser.add_argument("--aggregation", choices=["max", "mean", "first"], default="max",
+                       help="Метод агрегации тайлов")
     
-    # Загрузка
-    meta, embs, index, model_config = load_index(Path(args.index_dir))
+    # Дополнительно
+    parser.add_argument("--visualize", action="store_true", help="Создать визуализации")
+    parser.add_argument("--save-failures", action="store_true", help="Сохранить failure cases")
+    parser.add_argument("--check-preprocessing", action="store_true",
+                       help="Проверить preprocessing consistency")
     
-    # Тестовый набор
-    test_size = DEFAULT_QUICK_SIZE if args.quick else args.test_size
-    test_set = sample_test_set(meta, test_size)
+    args = parser.parse_args()
     
-    print(f"\n📋 Тестовый набор: {len(test_set)} кропов")
+    index_dir = Path(args.index_dir)
+    crops_meta = Path(args.crops_meta)
     
-    # Валидатор
-    validator = IndexValidator(meta, embs, index, model_config)
+    if not index_dir.exists():
+        print(f"[!] Не найдена папка индекса: {index_dir}")
+        sys.exit(1)
     
-    # Тесты
-    validator.test_self_retrieval(test_set)
-    validator.test_same_pano_retrieval(test_set)
-    validator.test_similarity_distribution()
-    validator.benchmark_speed(test_set)
+    # Проверка preprocessing
+    if args.check_preprocessing:
+        check_preprocessing_consistency(index_dir, crops_meta)
+        return
     
-    # Сохранение отчёта
-    validator.save_report(args.report)
-    
-    print("\n" + "=" * 80)
-    print("✅ ВАЛИДАЦИЯ ЗАВЕРШЕНА")
-    print("=" * 80)
-    
-    # Итоговая оценка
-    self_ret = validator.results.get("test_self_retrieval", {})
-    top1_acc = self_ret.get("top1_acc", 0)
-    
-    print(f"\n🎯 Общая оценка:")
-    if top1_acc >= 95:
-        print("   ✅ ✅ ✅ ОТЛИЧНО! Индекс готов к продакшену")
-    elif top1_acc >= 85:
-        print("   ✅ ✅ ХОРОШО! Индекс работает корректно")
-    elif top1_acc >= 70:
-        print("   ⚠️  УДОВЛЕТВОРИТЕЛЬНО. Рекомендуется пересобрать индекс")
-    else:
-        print("   ❌ ПЛОХО! Индекс не работает, нужна отладка!")
+    # Валидация
+    validate_index(
+        index_dir=index_dir,
+        crops_meta=crops_meta,
+        test_size=args.test_size,
+        ef=args.ef,
+        topk=args.topk,
+        tile_size=args.tile_size,
+        tile_stride=args.tile_stride,
+        aggregation=args.aggregation,
+        save_failures=args.save_failures,
+        visualize=args.visualize,
+    )
 
 
 if __name__ == "__main__":
