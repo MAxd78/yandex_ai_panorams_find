@@ -13,12 +13,15 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast
 from PIL import Image
+from contextlib import nullcontext
+from torch import amp
+
 import open_clip
 
 # ========================= GeM Pooling =========================
@@ -162,56 +165,64 @@ class GeolocalizationDataset(Dataset):
 # ========================= Training =========================
 
 def train_epoch(model, dataloader, optimizer, criterion, device, scaler=None):
+
     model.train()
     total_loss = 0.0
     n_batches = 0
-    
+
+    autocast_ctx = amp.autocast('cuda') if scaler is not None and device.type == 'cuda' else nullcontext()
+
     pbar = tqdm(dataloader, desc="Training", unit="batch")
     for images, labels, _ in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        optimizer.zero_grad()
-        
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast_ctx:
+            embeddings = model(images)
+            loss = criterion(embeddings, labels)
+
         if scaler is not None:
-            with torch.cuda.amp.autocast():
-                embeddings = model(images)
-                loss = criterion(embeddings, labels)
-            
             scaler.scale(loss).backward()
+            # optional gradient clipping
+            try:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            except Exception:
+                pass
             scaler.step(optimizer)
             scaler.update()
         else:
-            embeddings = model(images)
-            loss = criterion(embeddings, labels)
-            
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-        
-        total_loss += loss.item()
+
+        total_loss += float(loss.detach().item())
         n_batches += 1
-        
-        pbar.set_postfix({'loss': f"{loss.item():.4f}"})
-    
+        pbar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
     return total_loss / max(n_batches, 1)
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device):
+
     model.eval()
     total_loss = 0.0
     n_batches = 0
-    
+
+    autocast_ctx = amp.autocast('cuda') if device.type == 'cuda' else nullcontext()
+
     for images, labels, _ in tqdm(dataloader, desc="Validation", unit="batch"):
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        embeddings = model(images)
-        loss = criterion(embeddings, labels)
-        
-        total_loss += loss.item()
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        with autocast_ctx:
+            embeddings = model(images)
+            loss = criterion(embeddings, labels)
+        total_loss += float(loss.detach().item())
         n_batches += 1
-    
     return total_loss / max(n_batches, 1)
+
+
 
 # ========================= Main =========================
 
@@ -312,7 +323,7 @@ def main():
     )
     
     # Scaler (исправлено для новой версии PyTorch)
-    scaler = torch.cuda.amp.GradScaler() if args.fp16 else None
+    scaler = amp.GradScaler('cuda') if args.fp16 else None
     
     # Training
     print(f"\n[5/6] Начало обучения ({args.epochs} epochs)")
@@ -371,3 +382,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
