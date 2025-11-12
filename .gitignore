@@ -19,7 +19,6 @@ __pycache__/
 
 # Данные и индексы — НЕ пушим
 data/
-index/
 meta/
 outputs/
 runs/

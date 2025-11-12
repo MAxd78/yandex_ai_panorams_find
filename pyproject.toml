@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geoai"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy", "pillow", "faiss-cpu", "scikit-learn", "pandas",
+  "pyyaml", "tqdm", "torch", "torchvision", "transformers",
+  "paddlepaddle==2.6.1; platform_system!='Darwin'",
+  "paddleocr==2.7.0.3",
+  "ultralytics",  # YOLOv8 для детекции текста
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,9 @@
+{
+  "model": "ViT-L-14",
+  "pretrained": "openai",
+  "embed_dim": 768,
+  "tile_size": 336,
+  "tile_stride": 224,
+  "seed": 42,
+  "version": "2.0"
+}
