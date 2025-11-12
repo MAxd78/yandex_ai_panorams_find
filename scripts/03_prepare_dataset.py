@@ -7,7 +7,7 @@
 Каждый кроп — это отдельное "view" из панорамы под определённым углом.
 
 Использование:
-  python scripts/03_prepare_dataset.py \
+python scripts/03_prepare_dataset.py \
     --panos-dir data/panos_raw \
     --panos-meta meta/panos_bbox.csv \
     --output-dir data/crops \
@@ -18,6 +18,7 @@
 """
 
 from __future__ import annotations
+
 import os
 import sys
 import argparse
@@ -30,11 +31,12 @@ from PIL import Image
 import cv2
 
 # ========================= Константы =========================
-DEFAULT_YAW_STEP = 15  # Шаг по горизонтали (градусы)
-DEFAULT_PITCH = 3  # Угол наклона вверх (градусы)
-DEFAULT_FOV = 80  # Field of view (градусы)
-DEFAULT_OUTPUT_WIDTH = 640  # Ширина выходного кропа
-DEFAULT_OUTPUT_HEIGHT = 640  # Высота выходного кропа
+
+DEFAULT_YAW_STEP = 15      # Шаг по горизонтали (градусы)
+DEFAULT_PITCH = 3          # Угол наклона вверх (градусы)
+DEFAULT_FOV = 80           # Field of view (градусы)
+DEFAULT_OUTPUT_WIDTH = 640 # Ширина выходного кропа
+DEFAULT_OUTPUT_HEIGHT = 640 # Высота выходного кропа
 
 # ========================= Equirectangular to Perspective =========================
 
@@ -123,11 +125,54 @@ def equirectangular_to_perspective(
     
     return perspective
 
+# ========================= File Finding =========================
+
+def find_pano_file(pano_id: str, panos_dir: Path) -> Path | None:
+    """
+    Найти файл панорамы по pano_id
+    
+    Args:
+        pano_id: ID панорамы (например, "1297341509_673392453_23_1687859493")
+        panos_dir: Папка с панорамами
+    
+    Returns:
+        Path к файлу или None
+    """
+    # Формат имени: {pano_id}_z0.jpg
+    # Пример: 1297341509_673392453_23_1687859493_z0.jpg
+    
+    # Вариант 1: точное совпадение
+    exact_match = panos_dir / f"{pano_id}_z0.jpg"
+    if exact_match.exists():
+        return exact_match
+    
+    # Вариант 2: без суффикса _z0
+    without_suffix = panos_dir / f"{pano_id}.jpg"
+    if without_suffix.exists():
+        return without_suffix
+    
+    # Вариант 3: поиск по паттерну (первые два числа из pano_id)
+    parts = pano_id.split('_')
+    if len(parts) >= 2:
+        # Ищем файлы начинающиеся с первых двух частей
+        pattern = f"{parts[0]}_{parts[1]}_*.jpg"
+        matches = list(panos_dir.glob(pattern))
+        
+        # Ищем точное совпадение по pano_id
+        for match in matches:
+            if pano_id in match.stem:
+                return match
+        
+        # Если не нашли точное, берём первое
+        if matches:
+            return matches[0]
+    
+    return None
 
 # ========================= Crop Generation =========================
 
 def generate_crops_from_panorama(
-    pano_path: str,
+    pano_path: Path,
     pano_id: str,
     lat: float,
     lon: float,
@@ -146,12 +191,12 @@ def generate_crops_from_panorama(
     """
     # Загрузка панорамы
     try:
-        pano_img = cv2.imread(pano_path)
+        pano_img = cv2.imread(str(pano_path))
         if pano_img is None:
             raise RuntimeError(f"Не удалось загрузить {pano_path}")
         pano_img = cv2.cvtColor(pano_img, cv2.COLOR_BGR2RGB)
     except Exception as e:
-        print(f"[!] Ошибка загрузки {pano_path}: {e}")
+        print(f"\n[!] Ошибка загрузки {pano_path}: {e}")
         return []
     
     crops_meta = []
@@ -184,7 +229,7 @@ def generate_crops_from_panorama(
             crops_meta.append({
                 "crop_id": crop_id,
                 "pano_id": pano_id,
-                "path": str(crop_path),
+                "path": str(crop_path.absolute()),
                 "yaw": yaw,
                 "pitch": pitch,
                 "fov": fov,
@@ -193,11 +238,10 @@ def generate_crops_from_panorama(
             })
             
         except Exception as e:
-            print(f"[!] Ошибка создания кропа yaw={yaw}: {e}")
+            print(f"\n[!] Ошибка создания кропа yaw={yaw} для {pano_id}: {e}")
             continue
     
     return crops_meta
-
 
 # ========================= Main =========================
 
@@ -207,12 +251,16 @@ def main():
     )
     
     # Входные данные
-    parser.add_argument("--panos-dir", required=True, help="Папка с панорамами")
-    parser.add_argument("--panos-meta", required=True, help="CSV с метаданными панорам")
+    parser.add_argument("--panos-dir", required=True, 
+                       help="Папка с панорамами")
+    parser.add_argument("--panos-meta", required=True, 
+                       help="CSV с метаданными панорам (pano_id,lat,lon,date)")
     
     # Выходные данные
-    parser.add_argument("--output-dir", required=True, help="Папка для кропов")
-    parser.add_argument("--output-meta", required=True, help="CSV для метаданных кропов")
+    parser.add_argument("--output-dir", required=True, 
+                       help="Папка для кропов")
+    parser.add_argument("--output-meta", required=True, 
+                       help="CSV для метаданных кропов")
     
     # Параметры кропов
     parser.add_argument("--yaw-step", type=float, default=DEFAULT_YAW_STEP,
@@ -249,11 +297,16 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Загрузка метаданных панорам
-    print(f"[i] Загрузка метаданных панорам...")
+    print(f"[i] Загрузка метаданных панорам: {panos_meta_path}")
     panos_df = pd.read_csv(panos_meta_path)
     
-    if "pano_id" not in panos_df.columns or "lat" not in panos_df.columns or "lon" not in panos_df.columns:
-        print("[!] В метаданных должны быть колонки: pano_id, lat, lon")
+    # Проверка обязательных колонок
+    required_cols = ["pano_id", "lat", "lon"]
+    missing_cols = [col for col in required_cols if col not in panos_df.columns]
+    
+    if missing_cols:
+        print(f"[!] В метаданных отсутствуют колонки: {missing_cols}")
+        print(f"    Найденные колонки: {list(panos_df.columns)}")
         sys.exit(1)
     
     print(f"[✓] Загружено {len(panos_df)} панорам")
@@ -261,7 +314,7 @@ def main():
     # Генерация кропов
     print(f"\n[i] Генерация кропов...")
     print(f"    Параметры: yaw_step={args.yaw_step}°, pitch={args.pitch}°, fov={args.fov}°")
-    print(f"    Размер кропа: {args.output_width}x{args.output_height}")
+    print(f"    Размер кропа: {args.output_width}×{args.output_height}")
     
     n_crops_per_pano = int(360 / args.yaw_step)
     print(f"    Ожидается ~{n_crops_per_pano} кропов на панораму")
@@ -270,53 +323,54 @@ def main():
     all_crops_meta = []
     success_count = 0
     error_count = 0
+    not_found_count = 0
     
-    for _, row in tqdm(panos_df.iterrows(), total=len(panos_df), desc="Панорамы", unit="pano"):
+    # Обработка каждой панорамы
+    for idx, row in tqdm(panos_df.iterrows(), total=len(panos_df), 
+                         desc="Обработка панорам", unit="pano"):
         pano_id = str(row["pano_id"])
         lat = float(row["lat"])
         lon = float(row["lon"])
         
         # Поиск файла панорамы
-        # Формат имени: {pano_id}_z0.jpg
-        pano_filename = f"{pano_id}_z0.jpg"
-        pano_path = panos_dir / pano_filename
+        pano_path = find_pano_file(pano_id, panos_dir)
         
-        if not pano_path.exists():
-            # Пробуем другие варианты имени
-            candidates = list(panos_dir.glob(f"{pano_id}*.jpg"))
-            if not candidates:
-                print(f"[!] Не найдена панорама: {pano_id}")
-                error_count += 1
-                continue
-            pano_path = candidates[0]
+        if pano_path is None:
+            tqdm.write(f"[!] Не найдена панорама: {pano_id}")
+            not_found_count += 1
+            error_count += 1
+            continue
         
         # Проверка skip-existing
         if args.skip_existing:
-            first_crop_path = output_dir / f"{pano_id}_yaw0_pitch{int(args.pitch)}.jpg"
+            first_crop_id = f"{pano_id}_yaw0_pitch{int(args.pitch)}"
+            first_crop_path = output_dir / f"{first_crop_id}.jpg"
+            
             if first_crop_path.exists():
-                # Предполагаем что все кропы уже созданы
-                # Загружаем их метаданные
+                # Загружаем метаданные существующих кропов
                 yaw_angles = np.arange(0, 360, args.yaw_step)
                 for yaw in yaw_angles:
                     crop_id = f"{pano_id}_yaw{int(yaw)}_pitch{int(args.pitch)}"
                     crop_path = output_dir / f"{crop_id}.jpg"
+                    
                     if crop_path.exists():
                         all_crops_meta.append({
                             "crop_id": crop_id,
                             "pano_id": pano_id,
-                            "path": str(crop_path),
+                            "path": str(crop_path.absolute()),
                             "yaw": yaw,
                             "pitch": args.pitch,
                             "fov": args.fov,
                             "lat": lat,
                             "lon": lon,
                         })
+                
                 success_count += 1
                 continue
         
         # Генерация кропов
         crops_meta = generate_crops_from_panorama(
-            pano_path=str(pano_path),
+            pano_path=pano_path,
             pano_id=pano_id,
             lat=lat,
             lon=lon,
@@ -335,7 +389,7 @@ def main():
             error_count += 1
     
     # Сохранение метаданных
-    print(f"\n[i] Сохранение метаданных...")
+    print(f"\n[i] Сохранение метаданных кропов...")
     crops_df = pd.DataFrame(all_crops_meta)
     
     output_meta_path = Path(args.output_meta)
@@ -343,21 +397,33 @@ def main():
     crops_df.to_csv(output_meta_path, index=False)
     
     # Статистика
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 70)
     print("✅ СОЗДАНИЕ КРОПОВ ЗАВЕРШЕНО")
-    print("=" * 60)
+    print("=" * 70)
     print(f"Обработано панорам: {success_count}/{len(panos_df)}")
-    print(f"Ошибок: {error_count}")
+    print(f"Не найдено файлов: {not_found_count}")
+    print(f"Ошибок при обработке: {error_count - not_found_count}")
     print(f"Создано кропов: {len(all_crops_meta)}")
-    print(f"Метаданные сохранены: {output_meta_path}")
-    print(f"Кропы сохранены в: {output_dir}/")
-    print("\n📊 Статистика:")
-    print(f"   Средних кропов на панораму: {len(all_crops_meta) / max(success_count, 1):.1f}")
-    print(f"   Размер одного кропа: ~{args.output_width * args.output_height * 3 / 1024 / 1024:.1f} MB")
-    print(f"   Общий размер кропов: ~{len(all_crops_meta) * args.output_width * args.output_height * 3 / 1024 / 1024 / 1024:.1f} GB")
-    print("\n🎯 Следующий шаг:")
-    print("   python scripts/04_build_index.py --crops-meta meta/crops.csv")
-
+    
+    if success_count > 0:
+        avg_crops = len(all_crops_meta) / success_count
+        print(f"\n📊 Статистика:")
+        print(f"   Средних кропов на панораму: {avg_crops:.1f}")
+        print(f"   Размер одного кропа: ~{args.output_width * args.output_height * 3 / 1024:.0f} KB")
+        total_size_gb = len(all_crops_meta) * args.output_width * args.output_height * 3 / 1024 / 1024 / 1024
+        print(f"   Общий размер кропов: ~{total_size_gb:.1f} GB")
+    
+    print(f"\n💾 Файлы:")
+    print(f"   Метаданные: {output_meta_path}")
+    print(f"   Кропы: {output_dir}/")
+    
+    print(f"\n🎯 Следующий шаг:")
+    print(f"   python scripts/04_extract_ocr.py --crops-meta {output_meta_path} --output-meta meta/crops_with_ocr.csv")
+    
+    # Показать пример первых кропов
+    if len(crops_df) > 0:
+        print(f"\n📋 Пример первых кропов:")
+        print(crops_df[['crop_id', 'pano_id', 'yaw', 'lat', 'lon']].head(3).to_string(index=False))
 
 if __name__ == "__main__":
     main()
