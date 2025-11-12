@@ -3,14 +3,7 @@
 """
 05_train_model.py — Fine-tuning CLIP с GeM pooling и Triplet Loss
 
-Обучает модель различать локации вашего района через metric learning
-
-Использование:
-python scripts/05_train_model.py \
-    --crops-meta meta/crops_with_ocr.csv \
-    --output-dir models/clip_gem \
-    --epochs 50 \
-    --batch-size 64
+ИСПРАВЛЕННАЯ ВЕРСИЯ для ViT архитектуры
 """
 
 import os
@@ -44,42 +37,68 @@ class GeM(nn.Module):
         ).pow(1.0 / self.p).squeeze(-1).squeeze(-1)
 
 class CLIPGeM(nn.Module):
-    """CLIP + GeM pooling для геолокализации"""
+    """CLIP + GeM pooling для геолокализации (ViT версия)"""
     def __init__(self, clip_model, gem_p=3.0, freeze_layers=True):
         super().__init__()
         self.visual = clip_model.visual
         self.gem = GeM(p=gem_p, learn_p=True)
         
-        # Замораживаем первые слои (оставляем последние для fine-tuning)
+        # Замораживаем первые слои
         if freeze_layers:
+            # Размораживаем только последние 3 блока трансформера
             for name, param in self.visual.named_parameters():
-                # Размораживаем только последний блок трансформера
-                if 'transformer.resblocks.23' not in name and \
-                   'transformer.resblocks.22' not in name and \
-                   'transformer.resblocks.21' not in name:
-                    param.requires_grad = False
+                param.requires_grad = False
+                
+                # Размораживаем последние блоки
+                if any(x in name for x in ['transformer.resblocks.21', 
+                                            'transformer.resblocks.22', 
+                                            'transformer.resblocks.23']):
+                    param.requires_grad = True
+            
+            # Всегда размораживаем GeM
+            for param in self.gem.parameters():
+                param.requires_grad = True
         
     def forward(self, x):
-        # Extract features перед pooling
-        # Для ViT нужно обойти final pooling
-        x = self.visual.conv1(x)  # patch embedding
-        x = x.reshape(x.shape, x.shape, -1)  # [B, C, HW]
-        x = x.permute(0, 2, 1)  # [B, HW, C]
-        x = torch.cat([self.visual.class_embedding.to(x.dtype) + \
-                      torch.zeros(x.shape, 1, x.shape[-1], dtype=x.dtype, device=x.device), 
-                      x], dim=1)  # [B, HW+1, C]
+        """
+        Forward pass через CLIP ViT + GeM pooling
+        
+        Args:
+            x: [B, 3, H, W] изображения
+        
+        Returns:
+            [B, D] нормализованные embeddings
+        """
+        # Проходим через CLIP visual encoder до последнего слоя
+        # Но останавливаемся ПЕРЕД final projection
+        
+        # Patch embedding
+        x = self.visual.conv1(x)  # [B, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, grid**2]
+        x = x.permute(0, 2, 1)  # [B, grid**2, width]
+        
+        # Добавляем class token и positional embedding
+        x = torch.cat([
+            self.visual.class_embedding.to(x.dtype) + torch.zeros(
+                x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+            ), 
+            x
+        ], dim=1)  # [B, grid**2 + 1, width]
+        
         x = x + self.visual.positional_embedding.to(x.dtype)
         x = self.visual.ln_pre(x)
         
+        # Transformer blocks
         x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.visual.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         
-        # Reshape для GeM pooling [B, N, C] -> [B, C, H, W]
-        # Убираем class token
-        x = x[:, 1:, :]  # [B, HW, C]
-        B, HW, C = x.shape
-        H = W = int(np.sqrt(HW))
+        # Убираем class token, оставляем только patch tokens
+        x = x[:, 1:, :]  # [B, grid**2, width]
+        
+        # Reshape для GeM pooling [B, grid**2, C] -> [B, C, H, W]
+        B, N, C = x.shape
+        H = W = int(np.sqrt(N))
         x = x.transpose(1, 2).reshape(B, C, H, W)
         
         # GeM pooling
@@ -107,13 +126,13 @@ class BatchHardTripletLoss(nn.Module):
         n_valid = 0
         
         for i in range(B):
-            # Hardest positive: максимальная дистанция с тем же pano_id
+            # Hardest positive
             pos_mask = (labels == labels[i]) & (torch.arange(B, device=labels.device) != i)
             if pos_mask.sum() == 0:
                 continue
             hardest_pos_dist = dist_mat[i][pos_mask].max()
             
-            # Hardest negative: минимальная дистанция с другим pano_id
+            # Hardest negative
             neg_mask = labels != labels[i]
             if neg_mask.sum() == 0:
                 continue
@@ -134,17 +153,9 @@ class GeolocalizationDataset(Dataset):
         self.transform = transform
         self.train = train
         
-        # Создаём маппинг pano_id -> label для triplet loss
+        # Создаём маппинг pano_id -> label
         unique_panos = crops_df['pano_id'].unique()
         self.pano_to_label = {pano: idx for idx, pano in enumerate(unique_panos)}
-        
-        # Для каждого pano_id храним индексы кропов (для sampling)
-        self.pano_to_crops = {}
-        for idx, row in crops_df.iterrows():
-            pano = row['pano_id']
-            if pano not in self.pano_to_crops:
-                self.pano_to_crops[pano] = []
-            self.pano_to_crops[pano].append(idx)
         
         print(f"[i] Dataset: {len(self.crops_df)} crops, {len(unique_panos)} unique panos")
     
@@ -158,7 +169,6 @@ class GeolocalizationDataset(Dataset):
         try:
             img = Image.open(row['path']).convert('RGB')
         except Exception as e:
-            print(f"[!] Error loading {row['path']}: {e}")
             # Fallback: black image
             img = Image.new('RGB', (640, 640), (0, 0, 0))
         
@@ -242,33 +252,33 @@ def main():
     
     # Модель
     parser.add_argument("--model-name", default="ViT-L-14",
-                       help="CLIP модель (default: ViT-L-14)")
+                       help="CLIP модель")
     parser.add_argument("--pretrained", default="openai",
-                       help="Pretrained source (default: openai)")
+                       help="Pretrained source")
     parser.add_argument("--gem-p", type=float, default=3.0,
-                       help="GeM pooling parameter (default: 3.0)")
+                       help="GeM pooling parameter")
     
     # Training
     parser.add_argument("--epochs", type=int, default=50,
-                       help="Количество эпох (default: 50)")
+                       help="Количество эпох")
     parser.add_argument("--batch-size", type=int, default=64,
-                       help="Batch size (default: 64)")
+                       help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-5,
-                       help="Learning rate для CLIP (default: 1e-5)")
+                       help="Learning rate для CLIP")
     parser.add_argument("--lr-gem", type=float, default=1e-3,
-                       help="Learning rate для GeM (default: 1e-3)")
+                       help="Learning rate для GeM")
     parser.add_argument("--margin", type=float, default=0.3,
-                       help="Triplet loss margin (default: 0.3)")
+                       help="Triplet loss margin")
     
-    # Разделение на train/val
+    # Разделение
     parser.add_argument("--val-split", type=float, default=0.1,
-                       help="Доля validation данных (default: 0.1)")
+                       help="Доля validation данных")
     
     # Оптимизации
     parser.add_argument("--fp16", action='store_true',
-                       help="Mixed precision training (RTX 5090)")
+                       help="Mixed precision training")
     parser.add_argument("--num-workers", type=int, default=4,
-                       help="DataLoader workers (default: 4)")
+                       help="DataLoader workers")
     
     args = parser.parse_args()
     
@@ -285,7 +295,7 @@ def main():
     crops_df = crops_df[existing_mask].reset_index(drop=True)
     print(f"[✓] {len(crops_df)} кропов")
     
-    # Train/Val split по панорамам (не по кропам!)
+    # Train/Val split по панорамам
     unique_panos = crops_df['pano_id'].unique()
     np.random.seed(42)
     np.random.shuffle(unique_panos)
