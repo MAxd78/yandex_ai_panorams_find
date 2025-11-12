@@ -100,9 +100,8 @@ class BatchHardTripletLoss(nn.Module):
         # Pairwise distances
         dist_mat = torch.cdist(embeddings, embeddings, p=2)
         
-        # Инициализируем loss как тензор
-        loss = torch.tensor(0.0, device=device, dtype=embeddings.dtype)
-        n_valid = 0
+        # Список для накопления triplet losses
+        triplet_losses = []
         
         for i in range(B):
             # Hardest positive
@@ -117,15 +116,16 @@ class BatchHardTripletLoss(nn.Module):
                 continue
             hardest_neg_dist = dist_mat[i][neg_mask].min()
             
-            # Triplet loss
-            loss = loss + F.relu(hardest_pos_dist - hardest_neg_dist + self.margin)
-            n_valid += 1
+            # Triplet loss for this anchor
+            triplet_loss = F.relu(hardest_pos_dist - hardest_neg_dist + self.margin)
+            triplet_losses.append(triplet_loss)
         
-        # ВАЖНО: возвращаем тензор, а не float
-        if n_valid > 0:
-            return loss / n_valid
+        # Возвращаем среднее значение или 0 если нет валидных триплетов
+        if triplet_losses:
+            return torch.stack(triplet_losses).mean()
         else:
-            return loss
+            # Возвращаем тензор с градиентом, который равен 0
+            return torch.zeros(1, device=device, dtype=embeddings.dtype, requires_grad=True).squeeze()
 
 # ========================= Dataset =========================
 
