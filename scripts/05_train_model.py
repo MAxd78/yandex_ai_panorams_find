@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from PIL import Image
 import open_clip
 
@@ -173,7 +174,7 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler=None):
         optimizer.zero_grad()
         
         if scaler is not None:
-            with torch.amp.autocast('cuda'):
+            with torch.cuda.amp.autocast():
                 embeddings = model(images)
                 loss = criterion(embeddings, labels)
             
@@ -311,7 +312,7 @@ def main():
     )
     
     # Scaler (исправлено для новой версии PyTorch)
-    scaler = torch.amp.GradScaler('cuda') if args.fp16 else None
+    scaler = torch.cuda.amp.GradScaler() if args.fp16 else None
     
     # Training
     print(f"\n[5/6] Начало обучения ({args.epochs} epochs)")
